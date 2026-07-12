@@ -28,6 +28,14 @@ MemoHood is a dialogue-memory plugin for [hermes-agent](https://github.com/NousR
 
 Without memory, an agent only knows what fits in the current conversation context: start a new session and everything from yesterday is gone. MemoHood stores what matters separately, in a local database on your own machine, and blends the relevant pieces back into the conversation exactly when they'd be useful. It's a memory provider (`memory.provider`) for hermes-agent — installed with one command and runs fully on its own.
 
+## What it fixes
+
+- **The agent forgets everything the moment you close the chat.** → It remembers across sessions — facts live in a local database, not in a single conversation's context.
+- **You have to re-explain your own context by hand every time.** → Auto-recall pulls the relevant facts before every reply on its own, with no "remember that" prompt.
+- **It confuses an old decision with a new one and clings to the stale one.** → SUPERSEDE: the new fact goes on top, the old one is marked stale and kept with a date — you see both "as it is now" and "as it was".
+- **Memory lived "in the model's head" and reset when you switched models.** → Facts sit in a separate local database, not tied to any model: switch models and recall works exactly the same, nothing is lost.
+- **You pay tokens to process idle chit-chat.** → A cheap offline gate (Model2Vec) filters out small talk before the expensive model call.
+
 ## What you get
 
 - **Auto-recall before every reply.** Before the agent starts answering, MemoHood quietly searches memory for anything relevant: hybrid search combines full-text FTS5/BM25 with Russian stemming and vector search (the BGE-M3 model via Cloudflare Workers AI), fuses both result lists with Reciprocal Rank Fusion (RRF), and, if a key is configured, reranks the top candidates with Cohere.
