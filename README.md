@@ -94,6 +94,8 @@ flowchart LR
 
 ### Установка
 
+> **Ставите через Telegram-бота hermes?** Пришлите архив плагина в чат и попросите «распакуй и поставь по инструкции внутри» — агент выполнит установку по [`AGENTS.md`](AGENTS.md). Ниже — ручная установка в терминале.
+
 **1. Один командой.** Установщик сам находит venv `hermes-agent`, ставит зависимости (`sqlite-vec`, `PyStemmer`, `ftfy`, `requests`, `model2vec`), копирует папку плагина в `<HERMES_HOME>/plugins/memohood/` и включает `memory.provider: memohood` в `config.yaml` — руками копировать папку или редактировать конфиг не нужно:
 
 ```powershell

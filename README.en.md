@@ -94,6 +94,8 @@ flowchart LR
 
 ### Installation
 
+> **Installing via the hermes Telegram bot?** Send the plugin archive into the chat and ask it to "unpack and install using the instructions inside" — the agent will follow [`AGENTS.md`](AGENTS.md). The manual terminal install is below.
+
 **1. One command.** The installer finds the `hermes-agent` venv on its own, installs dependencies (`sqlite-vec`, `PyStemmer`, `ftfy`, `requests`, `model2vec`), copies the plugin folder into `<HERMES_HOME>/plugins/memohood/`, and switches on `memory.provider: memohood` in `config.yaml` — no manual copying, no manual config editing:
 
 ```powershell

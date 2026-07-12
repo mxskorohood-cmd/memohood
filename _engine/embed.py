@@ -209,6 +209,11 @@ def _embed_openai_compat(
 # multilingual (RU+EN), MIT-licensed.
 # ---------------------------------------------------------------------------
 
+# Needs fastembed>=0.6: since 0.6 fastembed pools e5 with MEAN (the way e5 was
+# trained), which is the behaviour this default is validated against. fastembed
+# <=0.5.1 used CLS pooling = a DIFFERENT vector space — indexes must not be mixed
+# across that boundary (re-embed on any such upgrade). The installers pin
+# ``fastembed>=0.6`` for exactly this reason.
 DEFAULT_LOCAL_MODEL = "intfloat/multilingual-e5-large"
 
 # One TextEmbedding instance per model id, cached for the process lifetime:
@@ -225,8 +230,8 @@ def _get_local_model(model: str):
         except ImportError as exc:
             raise EmbedError(
                 "local embedder needs the optional 'fastembed' package "
-                "(pip install fastembed) — only required when embedder.provider "
-                "is 'local'."
+                "(pip install \"fastembed>=0.6\") — only required when "
+                "embedder.provider is 'local'."
             ) from exc
         try:
             inst = TextEmbedding(model_name=model)
