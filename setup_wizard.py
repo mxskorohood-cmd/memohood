@@ -1,0 +1,512 @@
+"""``hermes memohood setup`` -- interactive onboarding wizard (plain input()/print).
+
+Walks the operator through the three cloud keys memohood can use (Cloudflare
+Workers AI embeddings, Cohere rerank, Gemini extraction/consolidation),
+checks the local python dependencies, and writes the keys into
+``HERMES_HOME/.env`` -- the same file hermes-core loads into the process
+environment at startup (see ``_engine/embed.py``'s module docstring), which
+is exactly where ``embed.py``/``rerank.py``/``extract_llm.py`` read them
+back from via ``os.environ``.
+
+Design constraints (mirroring the rest of this plugin):
+
+* Every step is skippable with a plain Enter. memohood degrades gracefully
+  without any key (FTS-only search / rrf-only ordering / signal-only
+  capture -- see the per-service fallbacks in embed/rerank/extract_llm),
+  so the wizard never insists, and each skip message says HONESTLY what
+  the user loses.
+* Live checks are exactly ONE http request each: browser ``User-Agent``
+  (reused from ``_engine/security.py`` -- Cloudflare rejects bare
+  python-requests UAs), 15s timeout, NO retries. An onboarding wizard must
+  never turn into a retry storm.
+* Secrets are never echoed back whole -- only :func:`mask_key`'s
+  "first 4 chars + ellipsis" form ever reaches the console, and live-check
+  error texts are scrubbed of the secret values before printing.
+* The pure helpers (:func:`validate_cf_account_id`,
+  :func:`validate_api_token`, :func:`validate_gemini_key`,
+  :func:`mask_key`, :func:`upsert_env_var`, :func:`check_dependencies`)
+  are module-level and side-effect-free so ``tests/test_setup_wizard.py``
+  can unit-test them directly; the interactive flow takes an injectable
+  ``input_fn`` for the same reason.
+* ``hermes_home`` is an explicit argument (same philosophy as ``db.py``:
+  never derive our own path unless asked to), with the standard
+  ``hermes_constants.get_hermes_home()`` fallback for standalone use.
+* Ctrl+C / closed stdin anywhere in the flow prints a calm "come back
+  later" note instead of a traceback.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+# Endpoint/model constants are imported from the modules that actually make
+# the production calls, so a wizard live-check always tests the very same
+# endpoint the plugin will use afterwards (no drift).
+from ._engine.rerank import COHERE_RERANK_URL, DEFAULT_MODEL as COHERE_MODEL
+from ._engine.security import DEFAULT_USER_AGENT
+from .extract_llm import DEFAULT_MODEL as GEMINI_MODEL, GEMINI_OPENAI_COMPAT_URL
+
+# ``embed.py`` has no module-level model constant (the model comes from
+# config's ``embedder.model``, default ``@cf/baai/bge-m3`` -- config.py
+# DEFAULTS); the wizard checks the default since that is what a fresh
+# install will use.
+CF_EMBED_MODEL = "@cf/baai/bge-m3"
+
+LIVE_CHECK_TIMEOUT_S = 15.0
+
+# import-name -> (pip-name, что даёт) -- mirrors plugin.yaml's pip_dependencies.
+_DEPENDENCIES: Tuple[Tuple[str, str], ...] = (
+    ("sqlite_vec", "sqlite-vec"),
+    ("Stemmer", "PyStemmer"),
+    ("ftfy", "ftfy"),
+    ("requests", "requests"),
+)
+
+_ACTION_RU = {
+    "added": "добавлено",
+    "replaced": "заменено",
+    "uncommented": "раскомментировано",
+}
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (unit-tested directly in tests/test_setup_wizard.py)
+# ---------------------------------------------------------------------------
+
+_CF_ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def validate_cf_account_id(value: str) -> bool:
+    """Cloudflare account id: exactly 32 hex chars (case-insensitive)."""
+    return bool(_CF_ACCOUNT_ID_RE.match((value or "").strip().lower()))
+
+
+def validate_api_token(value: str) -> bool:
+    """Generic API token/key: non-empty, no whitespace anywhere."""
+    v = (value or "").strip()
+    return bool(v) and not any(ch.isspace() for ch in v)
+
+
+def validate_gemini_key(value: str) -> bool:
+    """Gemini API key: starts with ``AIza``, no whitespace, plausible length."""
+    v = (value or "").strip()
+    return v.startswith("AIza") and len(v) >= 20 and not any(ch.isspace() for ch in v)
+
+
+def mask_key(value: str) -> str:
+    """Return a safe-to-print form of a secret: first 4 chars + ellipsis.
+
+    NEVER returns the full value; anything 4 chars or shorter collapses to
+    a bare ellipsis (showing "most of" a tiny secret is not masking).
+    """
+    v = value or ""
+    if len(v) <= 4:
+        return "…"
+    return v[:4] + "…"
+
+
+def upsert_env_var(path: "str | Path", key: str, value: str) -> str:
+    """Insert or update ``KEY=value`` in the ``.env`` file at *path* (UTF-8).
+
+    Rules (in priority order):
+      1. an active ``KEY=...`` line exists -> replace it in place;
+      2. a commented ``# KEY=...`` line exists -> uncomment it with the new
+         value (in place, preserving its position);
+      3. otherwise -> append at the end.
+
+    Creates the file (and parent dirs) if missing. Returns which action was
+    taken: ``"replaced"`` | ``"uncommented"`` | ``"added"`` -- callers use
+    it only for the human-readable log line.
+    """
+    p = Path(path)
+    lines: List[str] = []
+    if p.exists():
+        lines = p.read_text(encoding="utf-8").splitlines()
+
+    active_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    commented_re = re.compile(rf"^\s*#\s*{re.escape(key)}\s*=")
+    new_line = f"{key}={value}"
+    action = "added"
+
+    for i, line in enumerate(lines):
+        if active_re.match(line):
+            lines[i] = new_line
+            action = "replaced"
+            break
+    else:
+        for i, line in enumerate(lines):
+            if commented_re.match(line):
+                lines[i] = new_line
+                action = "uncommented"
+                break
+        else:
+            lines.append(new_line)
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return action
+
+
+def check_dependencies() -> List[Tuple[str, str, bool]]:
+    """Return ``(import_name, pip_name, importable)`` for each optional dep.
+
+    Uses ``importlib.util.find_spec`` so nothing heavy/native is actually
+    imported just to answer "is it installed?".
+    """
+    import importlib.util
+
+    out: List[Tuple[str, str, bool]] = []
+    for import_name, pip_name in _DEPENDENCIES:
+        try:
+            found = importlib.util.find_spec(import_name) is not None
+        except Exception:  # noqa: BLE001 - a broken package must read as "missing", not crash setup
+            found = False
+        out.append((import_name, pip_name, found))
+    return out
+
+
+def _mask_secrets(text: str, secrets: List[str]) -> str:
+    """Replace every occurrence of each secret in *text* with its mask, so
+    an HTTP error body / exception repr can never leak a key to the console."""
+    out = text
+    for s in secrets:
+        if s:
+            out = out.replace(s, mask_key(s))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Live checks: ONE request each, browser UA, 15s timeout, no retries.
+# ---------------------------------------------------------------------------
+
+
+def _live_headers(bearer: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {bearer}",
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+
+
+def check_cloudflare(account_id: str, api_token: str) -> Tuple[bool, str]:
+    """One embedding request against Workers AI. Returns (ok, human message)."""
+    import requests  # heavy/optional import kept local (plugin convention)
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{CF_EMBED_MODEL}"
+    secrets = [account_id, api_token]
+    try:
+        resp = requests.post(
+            url, headers=_live_headers(api_token), json={"text": ["привет"]},
+            timeout=LIVE_CHECK_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        return False, _mask_secrets(f"сеть/соединение: {exc}", secrets)
+    if resp.status_code != 200:
+        return False, _mask_secrets(f"HTTP {resp.status_code}: {resp.text[:200]}", secrets)
+    try:
+        data = resp.json()
+    except ValueError:
+        return False, "ответ не в формате JSON"
+    if isinstance(data, dict) and data.get("success") is False:
+        return False, _mask_secrets(f"Cloudflare ответил success=false: {str(data.get('errors'))[:200]}", secrets)
+    return True, "эмбеддинг получен, ключи рабочие"
+
+
+def check_cohere(api_key: str) -> Tuple[bool, str]:
+    """One rerank request with two tiny documents. Returns (ok, human message)."""
+    import requests  # heavy/optional import kept local (plugin convention)
+
+    body = {
+        "model": COHERE_MODEL,
+        "query": "столица Франции",
+        "documents": ["Париж -- столица Франции.", "Лондон -- столица Великобритании."],
+        "top_n": 1,
+    }
+    try:
+        resp = requests.post(
+            COHERE_RERANK_URL, headers=_live_headers(api_key), json=body,
+            timeout=LIVE_CHECK_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        return False, _mask_secrets(f"сеть/соединение: {exc}", [api_key])
+    if resp.status_code != 200:
+        return False, _mask_secrets(f"HTTP {resp.status_code}: {resp.text[:200]}", [api_key])
+    try:
+        data = resp.json()
+    except ValueError:
+        return False, "ответ не в формате JSON"
+    if not isinstance(data, dict) or "results" not in data:
+        return False, "неожиданный формат ответа rerank"
+    return True, "реранк отработал, ключ рабочий"
+
+
+def check_gemini(api_key: str) -> Tuple[bool, str]:
+    """One tiny chat request via the OpenAI-compatible REST endpoint --
+    the exact endpoint/auth style ``extract_llm.py`` uses in production."""
+    import requests  # heavy/optional import kept local (plugin convention)
+
+    body = {
+        "model": GEMINI_MODEL,
+        "messages": [{"role": "user", "content": "Ответь одним словом: привет"}],
+        "max_tokens": 8,
+        "temperature": 0.0,
+    }
+    try:
+        resp = requests.post(
+            GEMINI_OPENAI_COMPAT_URL, headers=_live_headers(api_key), json=body,
+            timeout=LIVE_CHECK_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        return False, _mask_secrets(f"сеть/соединение: {exc}", [api_key])
+    if resp.status_code != 200:
+        return False, _mask_secrets(f"HTTP {resp.status_code}: {resp.text[:200]}", [api_key])
+    try:
+        data = resp.json()
+    except ValueError:
+        return False, "ответ не в формате JSON"
+    if not isinstance(data, dict) or "choices" not in data:
+        return False, "неожиданный формат ответа модели"
+    return True, "модель ответила, ключ рабочий"
+
+
+# ---------------------------------------------------------------------------
+# Interactive flow
+# ---------------------------------------------------------------------------
+
+
+def _ask_valid(input_fn, prompt: str, validate, invalid_msg: str) -> str:
+    """Ask until *validate* passes or the user presses Enter ("" = skip)."""
+    while True:
+        value = (input_fn(prompt) or "").strip()
+        if not value:
+            return ""
+        if validate(value):
+            return value
+        print(f"{invalid_msg} Попробуйте ещё раз (Enter = пропустить).")
+
+
+def _yes(input_fn, prompt: str) -> bool:
+    """Enter = да; anything starting with n/н = нет."""
+    answer = (input_fn(prompt) or "").strip().lower()
+    return not answer.startswith(("n", "н"))
+
+
+def _confirm_after_check(run_check, input_fn) -> bool:
+    """Offer a live check. Returns True if the entered values should be kept
+    (check skipped, check passed, or check failed but the user insists)."""
+    if not _yes(input_fn, "Проверить живым запросом? (Enter = да / n = нет): "):
+        print("Хорошо, проверять не будем -- просто сохраним.")
+        return True
+    ok, msg = run_check()
+    if ok:
+        print(f"Проверка прошла: {msg}.")
+        return True
+    print(f"Проверка не прошла: {msg}.")
+    return _yes(input_fn, "Сохранить всё равно? (Enter = да / n = не сохранять): ")
+
+
+_CF_SKIP_MSG = "Пропущено: память будет искать только по словам (FTS), без поиска по смыслу."
+_COHERE_SKIP_MSG = "Пропущено: поиск останется гибридным, но сортировка будет чуть грубее."
+_GEMINI_SKIP_MSG = (
+    "Пропущено: спорные факты не будут запоминаться, только очевидные; "
+    "ночная консолидация -- только механическая часть."
+)
+
+
+def _step_cloudflare(input_fn) -> Tuple[Dict[str, str], str]:
+    print()
+    print("Шаг 1 из 4 -- Cloudflare Workers AI (эмбеддинги BGE-M3).")
+    print("Это облачный переводчик текста в числа-смыслы: с ним память находит")
+    print("записи по смыслу, а не только по точному совпадению слов.")
+    print("Бесплатного лимита Cloudflare хватает с большим запасом.")
+    print("Где взять: dash.cloudflare.com -> Workers AI (account id и API-токен).")
+
+    account_id = _ask_valid(
+        input_fn,
+        "Cloudflare ACCOUNT_ID (Enter = пропустить): ",
+        validate_cf_account_id,
+        "Не похоже на account id: нужно ровно 32 символа из 0-9 и a-f.",
+    )
+    if not account_id:
+        print(_CF_SKIP_MSG)
+        return {}, "пропущено"
+
+    api_token = _ask_valid(
+        input_fn,
+        "Cloudflare API_TOKEN (Enter = пропустить): ",
+        validate_api_token,
+        "Токен не может быть пустым или содержать пробелы.",
+    )
+    if not api_token:
+        print(_CF_SKIP_MSG)
+        return {}, "пропущено"
+
+    if not _confirm_after_check(lambda: check_cloudflare(account_id, api_token), input_fn):
+        print(_CF_SKIP_MSG)
+        return {}, "пропущено (проверка не прошла)"
+    return (
+        {"CLOUDFLARE_ACCOUNT_ID": account_id, "CLOUDFLARE_API_TOKEN": api_token},
+        f"настроено ({mask_key(api_token)})",
+    )
+
+
+def _step_single_key(
+    input_fn,
+    *,
+    header_lines: Tuple[str, ...],
+    env_var: str,
+    prompt: str,
+    validate,
+    invalid_msg: str,
+    check_name: str,
+    skip_msg: str,
+) -> Tuple[Dict[str, str], str]:
+    """Shared shape of the Cohere/Gemini steps: one key, one live check.
+
+    The check function is looked up in module globals by *check_name* at
+    call time so tests can monkeypatch ``check_cohere``/``check_gemini`` on
+    this module and the wizard picks the patched version up.
+    """
+    print()
+    for line in header_lines:
+        print(line)
+    key = _ask_valid(input_fn, prompt, validate, invalid_msg)
+    if not key:
+        print(skip_msg)
+        return {}, "пропущено"
+    check_fn = globals()[check_name]
+    if not _confirm_after_check(lambda: check_fn(key), input_fn):
+        print(skip_msg)
+        return {}, "пропущено (проверка не прошла)"
+    return {env_var: key}, f"настроено ({mask_key(key)})"
+
+
+def _step_cohere(input_fn) -> Tuple[Dict[str, str], str]:
+    return _step_single_key(
+        input_fn,
+        header_lines=(
+            "Шаг 2 из 4 -- Cohere (реранкер).",
+            "Это строгий редактор: пересортировывает найденное так, что самое",
+            "нужное оказывается сверху. Бесплатный ключ: dashboard.cohere.com/api-keys",
+        ),
+        env_var="COHERE_API_KEY",
+        prompt="Cohere API_KEY (Enter = пропустить): ",
+        validate=validate_api_token,
+        invalid_msg="Ключ не может быть пустым или содержать пробелы.",
+        check_name="check_cohere",
+        skip_msg=_COHERE_SKIP_MSG,
+    )
+
+
+def _step_gemini(input_fn) -> Tuple[Dict[str, str], str]:
+    return _step_single_key(
+        input_fn,
+        header_lines=(
+            "Шаг 3 из 4 -- Gemini (LLM для фактов).",
+            "Это младший редактор: решает судьбу спорных фактов и делает ночную",
+            "уборку памяти. Модель flash-lite -- копеечная.",
+            "Ключ: aistudio.google.com/apikey (начинается с AIza).",
+        ),
+        env_var="GEMINI_API_KEY",
+        prompt="GEMINI_API_KEY (Enter = пропустить): ",
+        validate=validate_gemini_key,
+        invalid_msg="Ключ Gemini обычно начинается с «AIza» и не содержит пробелов.",
+        check_name="check_gemini",
+        skip_msg=_GEMINI_SKIP_MSG,
+    )
+
+
+def _step_dependencies() -> Tuple[List[str], str]:
+    print()
+    print("Шаг 4 из 4 -- проверка зависимостей (python-библиотек).")
+    missing: List[str] = []
+    for _import_name, pip_name, found in check_dependencies():
+        print(f"  {pip_name:<12} {'есть' if found else 'НЕТ'}")
+        if not found:
+            missing.append(pip_name)
+    if missing:
+        print("Не хватает библиотек. Команда для установки в venv hermes:")
+        print(f'  "{sys.executable}" -m pip install {" ".join(missing)}')
+        print("Запускать её вручную не обязательно: hermes доустановит зависимости")
+        print("сам при первом запуске памяти (pip_dependencies в plugin.yaml).")
+        return missing, "не хватает: " + ", ".join(missing)
+    print("Все зависимости на месте.")
+    return [], "все на месте"
+
+
+def _resolve_hermes_home(hermes_home: Optional[str]) -> str:
+    if hermes_home:
+        return str(hermes_home)
+    try:
+        from hermes_constants import get_hermes_home  # heavy import kept local
+
+        return str(get_hermes_home())
+    except Exception:  # noqa: BLE001 - standalone/dev run outside a hermes install
+        return str(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def _run(hermes_home: Optional[str], input_fn) -> None:
+    home = _resolve_hermes_home(hermes_home)
+    env_path = Path(home) / ".env"
+
+    print("Настройка памяти MemoHood.")
+    print()
+    print("Мастер пройдёт 4 шага: Cloudflare (поиск по смыслу), Cohere (сортировка")
+    print("результатов), Gemini (извлечение фактов) и проверка зависимостей.")
+    print("Каждый шаг можно пропустить -- просто нажмите Enter: память работает и")
+    print(f"без ключей, просто скромнее. Ключи будут записаны в {env_path};")
+    print("в консоли они никогда не показываются целиком.")
+
+    to_write: Dict[str, str] = {}
+    summary: List[Tuple[str, str]] = []
+
+    values, status = _step_cloudflare(input_fn)
+    to_write.update(values)
+    summary.append(("Cloudflare (эмбеддинги)", status))
+
+    values, status = _step_cohere(input_fn)
+    to_write.update(values)
+    summary.append(("Cohere (реранк)", status))
+
+    values, status = _step_gemini(input_fn)
+    to_write.update(values)
+    summary.append(("Gemini (факты)", status))
+
+    _missing, deps_status = _step_dependencies()
+    summary.append(("Зависимости", deps_status))
+
+    print()
+    if to_write:
+        for key, value in to_write.items():
+            action = upsert_env_var(env_path, key, value)
+            print(f"  {key} = {mask_key(value)} -- {_ACTION_RU.get(action, action)} в {env_path}")
+    else:
+        print(f"Ни одного ключа не введено -- {env_path} не тронут.")
+
+    print()
+    print("Итоги:")
+    for name, status in summary:
+        print(f"  {name}: {status}")
+    print()
+    print("Что дальше:")
+    print("  1. Перезапустите hermes, чтобы он подхватил ключи из .env.")
+    print("  2. Спросите бота: «что ты обо мне помнишь?»")
+
+
+def run_wizard(hermes_home: Optional[str] = None, *, input_fn: Callable[[str], str] = input) -> None:
+    """Entry point for ``hermes memohood setup`` (see ``cli.py``).
+
+    *input_fn* is injectable purely for tests; production callers pass
+    nothing and get the builtin ``input``. Ctrl+C / EOF anywhere in the
+    flow exits calmly instead of dumping a traceback.
+    """
+    try:
+        _run(hermes_home, input_fn)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        print("Настройка прервана. Ничего не сломалось -- продолжить можно в любой момент:")
+        print("  hermes memohood setup")

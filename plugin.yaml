@@ -1,0 +1,66 @@
+name: memohood
+version: 0.1.0
+description: >
+  MemoHood — диалоговая память hermes: авто-recall прошлых разговоров и решений
+  перед каждым ходом, авто-извлечение фактов (correction/decision/preference)
+  из диалога, гибридный поиск (FTS5 RU-стемминг + вектор Cloudflare BGE-M3 +
+  RRF), pinned-факты без забывания, SUPERSEDE вместо затирания истории.
+author: Maxim Vasko
+kind: exclusive
+
+# NOTE (verified against the plugin loader's API contract + plugins/memory/__init__.py
+# + hermes_cli/plugins.py, 2026-07-06): memory-provider plugins are NOT
+# scanned by the general PluginManager at all (bundled/user "memory" dirs are
+# explicitly skip_names'd there). They are discovered by
+# plugins/memory/__init__.py's own scanner instead, which:
+#   - is a directory-name scan under $HERMES_HOME/plugins/<name>/ (NOT
+#     $HERMES_HOME/plugins/memory/<name>/ for USER-installed providers --
+#     only the BUNDLED tree is namespaced under plugins/memory/; see
+#     plugins/memory/__init__.py:_get_user_plugins_dir()/_iter_provider_dirs()).
+#     DESIGN_v1.md's "installs to ~/.hermes/plugins/memory/memohood/" is therefore
+#     the install layout for BUNDLED-style docs/expectations, but the loader
+#     that will actually find a user-installed "memohood" looks in
+#     $HERMES_HOME/plugins/memohood/ directly. Both this plugin.yaml and __init__.py
+#     are written to work correctly at either path -- nothing here hardcodes
+#     the "memory/" segment -- but whoever writes the install script/README
+#     (later round) MUST install to $HERMES_HOME/plugins/memohood/, not
+#     $HERMES_HOME/plugins/memory/memohood/, or discovery will silently miss it.
+#   - reads `pip_dependencies` from THIS file for lazy-install, confirmed at
+#     hermes_cli/memory_setup.py:99 (`meta.get("pip_dependencies", [])`) --
+#     this is the one loader that actually honors the key (per the plugin
+#     loader's API contract: general plugins do NOT get this).
+#   - `kind: exclusive` matches the auto-coercion heuristic in
+#     hermes_cli/plugins.py (~line 1549: a plugin whose __init__.py contains
+#     "register_memory_provider"/"MemoryProvider" is auto-treated as
+#     kind="exclusive" even without this field) -- set explicitly here so the
+#     manifest is unambiguous to a human reader and to any future stricter
+#     loader that stops auto-coercing.
+pip_dependencies:
+  - sqlite-vec
+  - PyStemmer
+  - ftfy
+  - requests
+  # v1.1: gate.py's optional "model2vec" backend (memory.memohood.gate.backend:
+  # model2vec, opt-in only -- default stays "pass"). Tiny local/offline
+  # static-embedding package, no requires_env entry needed (no API key).
+  # Lazy-install only, per hermes_cli/memory_setup.py's pip_dependencies
+  # convention -- NOT installed by this round.
+  - model2vec
+
+# Informational only -- hermes does not validate or auto-configure these;
+# must already exist in $HERMES_HOME/.env. Absent keys degrade gracefully
+# per each module's own contract (embed/rerank/extract_llm all documented
+# to degrade, never crash plugin load).
+requires_env:
+  - GEMINI_API_KEY
+  - CLOUDFLARE_ACCOUNT_ID
+  - CLOUDFLARE_API_TOKEN
+  - COHERE_API_KEY
+
+hermes_core_min_version: "0.18.0"
+
+# No provides_tools/provides_hooks declared yet -- tools.py (memohood_search,
+# memohood_fetch, memohood_recall, memohood_stats, memohood_capture) and cli.py are
+# built in a later round per DESIGN_v1.md's file list. This manifest only
+# needs to be truthful about what THIS foundation round ships (provider
+# lifecycle only, no tools/hooks registered yet).

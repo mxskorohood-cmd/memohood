@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+*.excalidraw text eol=lf linguist-language=JSON
