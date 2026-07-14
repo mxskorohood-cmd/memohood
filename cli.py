@@ -136,7 +136,7 @@ def memohood_command(args) -> None:
                 f"Переиндексация завершена: {result.get('captures_embedded', 0)} записей переэмбеддено, "
                 f"векторный индекс готов: {result.get('vector_index_ready')}."
             )
-        except embed_mod.EmbedError as exc:
+        except (embed_mod.EmbedError, db.DbError) as exc:
             print(f"Ошибка переиндексации: {exc}")
         finally:
             conn.close()

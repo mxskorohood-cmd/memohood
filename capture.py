@@ -426,7 +426,7 @@ def _store_capture(
         if sim >= _DUP_COSINE_HI:
             action, supersedes_id = "duplicate", top["id"]
         elif sim >= _DUP_COSINE_LO:
-            judged = extract_llm.judge(content, candidates[:3], conn=conn)
+            judged = extract_llm.judge(content, candidates[:3], model=extract_llm.resolve_model(cfg), conn=conn)
             action = judged.get("action") or "independent"
             supersedes_id = judged.get("supersedes_id")
             if action not in ("duplicate", "supersede"):
@@ -548,7 +548,7 @@ def extract_and_store(
         source_type = "EXTRACTED"
         pinned = sig["pinned"]
     else:
-        result = extract_llm.extract(text, conn=conn)
+        result = extract_llm.extract(text, model=extract_llm.resolve_model(cfg), conn=conn)
         if result is None or not result.get("is_memorable"):
             return None
         kind = result["kind"]

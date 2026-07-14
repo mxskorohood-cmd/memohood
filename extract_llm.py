@@ -4,8 +4,8 @@ flash-lite call") and three-tier supersede classifier (modeled on
 gbrain's ``facts/classify.ts``: "cosine >= 0.95 -> дубль без
 LLM; иначе дешёвая модель решает duplicate|supersede|independent").
 
-Model/endpoint per this project's non-negotiables and its own
-accepted design decision: ``gemini-2.5-flash-lite`` via the OpenAI-compatible
+Endpoint per this project's non-negotiables and its own
+accepted design decision: the OpenAI-compatible
 REST surface at
 ``https://generativelanguage.googleapis.com/v1beta/openai/chat/completions``,
 authenticated with ``GEMINI_API_KEY`` (confirmed already present in
@@ -78,10 +78,26 @@ from ._engine.security import DEFAULT_USER_AGENT, fence_untrusted, scan_secrets
 logger = logging.getLogger("memohood.extract_llm")
 
 GEMINI_OPENAI_COMPAT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_TIMEOUT_S = 20.0
 MAX_RETRIES = 3
 _RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
+
+def resolve_model(cfg: Optional[Dict[str, Any]]) -> str:
+    """Resolve the configured ``model.model`` (``memory.memohood.model.model``
+    in config.yaml -- *cfg* is the full memohood config dict) to a model id,
+    falling back to :data:`DEFAULT_MODEL` if unset/malformed. Mirrors
+    ``_engine/rerank.py``'s own ``rerank_cfg.get("model") or DEFAULT_MODEL``
+    defensive-get pattern -- call-sites that already have ``cfg`` in scope
+    (``capture.py``/``consolidate.py``) use this instead of hardcoding
+    :data:`DEFAULT_MODEL`, so a ``memory.memohood.model.model`` override in
+    config.yaml actually reaches the Gemini call body, not just the setup
+    schema default."""
+    cfg = cfg or {}
+    mc = cfg.get("model")
+    return (mc.get("model") if isinstance(mc, dict) else None) or DEFAULT_MODEL
+
 
 _VALID_KINDS = frozenset(
     {"persona", "event", "preference", "decision", "correction", "fact", "instruction"}
@@ -97,7 +113,21 @@ class ExtractError(RuntimeError):
     """Raised internally for a failed Gemini call. Never escapes
     :func:`judge`/:func:`extract` — both catch this and degrade to a safe
     default (``None`` for extract, ``{"action": "independent", ...}`` for
-    judge, per each function's own documented fallback)."""
+    judge, per each function's own documented fallback).
+
+    ``status_code`` carries the HTTP status code when the failure was a
+    non-2xx response from Gemini, or ``None`` when the failure never got a
+    response at all (network error/timeout after retries exhausted, missing
+    ``GEMINI_API_KEY``, unparseable reply). Callers use this to distinguish
+    a config-shaped failure (401/403/404 -> bad key or a bad
+    ``memory.memohood.model.model``) from a transient network/rate-limit one
+    for logging purposes -- the degrade behavior itself (return
+    ``None``/``"independent"``) is identical either way.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +152,9 @@ def _request_with_backoff(
             resp = requests.post(url, headers=req_headers, json=json_body, timeout=timeout)
         except requests.RequestException as exc:
             if attempt >= max_retries:
-                raise ExtractError(f"request to {url} failed after {attempt} retries: {exc}") from exc
+                raise ExtractError(
+                    f"request to {url} failed after {attempt} retries: {exc}", status_code=None,
+                ) from exc
             time.sleep(min(2 ** attempt, 30))
             attempt += 1
             continue
@@ -193,7 +225,10 @@ def _call_gemini(
         GEMINI_OPENAI_COMPAT_URL, headers=headers, json_body=body, timeout=timeout, max_retries=max_retries,
     )
     if resp.status_code != 200:
-        raise ExtractError(f"Gemini call failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise ExtractError(
+            f"Gemini call failed: HTTP {resp.status_code}: {resp.text[:500]}",
+            status_code=resp.status_code,
+        )
 
     try:
         payload = resp.json()
@@ -281,7 +316,14 @@ def extract(turn_text: str, *, model: str = DEFAULT_MODEL, conn: Any = None) -> 
     try:
         result = _call_gemini(_EXTRACT_SYSTEM_PROMPT, fenced, model=model, conn=conn)
     except ExtractError as exc:
-        logger.info("extract_llm.extract: degraded (no capture will be made): %s", exc)
+        if exc.status_code in (401, 403, 404):
+            logger.warning(
+                "extract_llm.extract: LLM недоступна (HTTP %s): проверь GEMINI_API_KEY и "
+                "memory.memohood.model.model в конфиге; degrading (no capture will be made): %s",
+                exc.status_code, exc,
+            )
+        else:
+            logger.info("extract_llm.extract: degraded (no capture will be made): %s", exc)
         return None
     except Exception:  # noqa: BLE001 - any unexpected shape/network error must degrade, not crash the turn
         logger.warning("extract_llm.extract: unexpected error; degrading", exc_info=True)
@@ -360,7 +402,14 @@ def judge(
     try:
         result = _call_gemini(_JUDGE_SYSTEM_PROMPT, user_content, model=model, conn=conn)
     except ExtractError as exc:
-        logger.info("extract_llm.judge: degraded to independent: %s", exc)
+        if exc.status_code in (401, 403, 404):
+            logger.warning(
+                "extract_llm.judge: LLM недоступна (HTTP %s): проверь GEMINI_API_KEY и "
+                "memory.memohood.model.model в конфиге; degrading to independent: %s",
+                exc.status_code, exc,
+            )
+        else:
+            logger.info("extract_llm.judge: degraded to independent: %s", exc)
         return {"action": "independent", "supersedes_id": None, "reasoning": f"degraded: {exc}"}
     except Exception:  # noqa: BLE001 - any unexpected shape/network error must degrade, not crash the turn
         logger.warning("extract_llm.judge: unexpected error; degrading to independent", exc_info=True)
@@ -439,7 +488,14 @@ def summarize(
     try:
         result = _call_gemini(_SUMMARIZE_SYSTEM_PROMPT, user_content, model=model, conn=conn)
     except ExtractError as exc:
-        logger.info("extract_llm.summarize: degraded (no summary produced): %s", exc)
+        if exc.status_code in (401, 403, 404):
+            logger.warning(
+                "extract_llm.summarize: LLM недоступна (HTTP %s): проверь GEMINI_API_KEY и "
+                "memory.memohood.model.model в конфиге; degrading (no summary produced): %s",
+                exc.status_code, exc,
+            )
+        else:
+            logger.info("extract_llm.summarize: degraded (no summary produced): %s", exc)
         return None
     except Exception:  # noqa: BLE001 - any unexpected shape/network error must degrade, not crash the rollup job
         logger.warning("extract_llm.summarize: unexpected error; degrading", exc_info=True)

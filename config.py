@@ -42,7 +42,7 @@ DEFAULTS: Dict[str, Any] = {
         "model2vec_model": "minishlab/potion-base-8M",
         "meaningful_terms_floor": 3,
     },
-    "model": {"provider": "gemini", "model": "gemini-2.5-flash-lite"},
+    "model": {"provider": "gemini", "model": "gemini-3.1-flash-lite"},
     "embedder": {"provider": "cloudflare", "model": "@cf/baai/bge-m3", "dims": 1024},
     "rerank": {"provider": "cohere", "enabled": True},
     "auto_capture": True,

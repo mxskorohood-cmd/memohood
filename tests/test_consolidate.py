@@ -136,7 +136,7 @@ class TestRollup:
             )
         conn.commit()
 
-        monkeypatch.setattr(memohood.extract_llm, "summarize", lambda texts, *, level="day", conn=None: "Итоговое резюме дня.")
+        monkeypatch.setattr(memohood.extract_llm, "summarize", lambda texts, *, level="day", model=None, conn=None: "Итоговое резюме дня.")
         result = memohood.consolidate.run_rollup(conn, cfg)
         assert result["day"] == 1
 

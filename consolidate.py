@@ -338,7 +338,7 @@ def _rollup_level(
             continue
         texts = [it["content"] for it in items if it["content"]]
         try:
-            summary_text = extract_llm.summarize(texts, level=level, conn=conn)
+            summary_text = extract_llm.summarize(texts, level=level, model=extract_llm.resolve_model(cfg), conn=conn)
         except Exception:  # noqa: BLE001 - one bucket's LLM failure must not block the rest
             logger.warning("consolidate.run_rollup: summarize() raised for level=%s", level, exc_info=True)
             summary_text = None

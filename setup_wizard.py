@@ -32,11 +32,23 @@ Design constraints (mirroring the rest of this plugin):
   never derive our own path unless asked to), with the standard
   ``hermes_constants.get_hermes_home()`` fallback for standalone use.
 * Ctrl+C / closed stdin anywhere in the flow prints a calm "come back
-  later" note instead of a traceback.
+  later" note instead of a traceback -- and never loses an already-
+  confirmed EARLIER step's keys: each step's keys are upserted into .env
+  the moment that step completes, not batched until the very end (B4). A
+  ``.memohood-setup.partial.json`` checkpoint (step-completion flags ONLY,
+  never key values) next to .env lets a later run resume and skip
+  already-done steps (B10); it is deleted once every step has run clean.
+* After a Gemini key is entered and kept, the wizard offers to pick the
+  extraction/consolidation model from Gemini's live ListModels response
+  (falling back silently to the compiled-in default on any failure) and
+  persists a non-default choice to ``config.yaml``'s
+  ``memory.memohood.model.model`` via ``config.save_memohood_config_at``
+  -- never to .env, which stays secrets-only.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -49,6 +61,23 @@ from typing import Callable, Dict, List, Optional, Tuple
 from ._engine.rerank import COHERE_RERANK_URL, DEFAULT_MODEL as COHERE_MODEL
 from ._engine.security import DEFAULT_USER_AGENT
 from .extract_llm import DEFAULT_MODEL as GEMINI_MODEL, GEMINI_OPENAI_COMPAT_URL
+
+# Same-package config writer -- module-level import (not deferred) because
+# config.py itself has zero load-time cost (its own heavy imports, `yaml`/
+# `hermes_cli.config`, are local to its functions); mirrors provider.py's and
+# cli.py's own `from . import config as memohood_config` precedent. Used by
+# B6 to persist the ListModels-discovered model choice to config.yaml's
+# ``memory.memohood.model.model`` -- never to .env, secrets stay separate.
+from . import config as memohood_config
+
+# Same rationale as memohood_config above -- systemd_env.py is pure stdlib
+# (shutil/subprocess/pathlib/typing only, see its own module docstring), so
+# importing it at module level costs nothing. Used at the end of `_run`
+# (B12) to idempotently point a systemd-hosted gateway unit at
+# HERMES_HOME/.env, so `hermes gateway restart` actually picks up the keys
+# this wizard just wrote (no-op, never raises, when hermes isn't running
+# under systemd -- see systemd_env.detect_systemd_gateway's own guard).
+from . import systemd_env
 
 # ``embed.py`` has no module-level model constant (the model comes from
 # config's ``embedder.model``, default ``@cf/baai/bge-m3`` -- config.py
@@ -151,6 +180,67 @@ def upsert_env_var(path: "str | Path", key: str, value: str) -> str:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return action
+
+
+# ---------------------------------------------------------------------------
+# Resume checkpoint (B10): step-completion flags ONLY, next to .env.
+# NEVER holds key values -- secrets live exclusively in .env (see module
+# docstring / the project's secrets rule); this file just remembers WHICH of
+# the three key-collecting steps already ran, so a wizard interrupted by
+# EOFError/KeyboardInterrupt (B4) doesn't re-ask questions the operator
+# already answered on a previous run.
+# ---------------------------------------------------------------------------
+
+PARTIAL_SETUP_FILENAME = ".memohood-setup.partial.json"
+
+# "dependencies" is deliberately NOT in here: it has no prompts and is cheap
+# enough to re-run fresh every time -- this checkpoint exists to avoid
+# re-ASKING already-answered questions, not to skip a free instant check.
+RESUMABLE_STEPS: Tuple[str, ...] = ("cloudflare", "cohere", "gemini")
+
+# Human-readable labels for the "уже готово: ..." resume message only.
+_STEP_LABELS: Dict[str, str] = {
+    "cloudflare": "Cloudflare",
+    "cohere": "Cohere",
+    "gemini": "Gemini",
+}
+
+
+def load_setup_checkpoint(partial_path: "str | Path") -> List[str]:
+    """Read the ``steps_done`` list from the resume checkpoint at
+    *partial_path*. Never raises -- a missing or corrupt checkpoint just
+    means "nothing to resume", exactly like a fresh install."""
+    p = Path(partial_path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a broken checkpoint must read as "start over", not crash setup
+        return []
+    steps = data.get("steps_done") if isinstance(data, dict) else None
+    if not isinstance(steps, list):
+        return []
+    return [s for s in steps if isinstance(s, str)]
+
+
+def save_setup_checkpoint(partial_path: "str | Path", steps_done: List[str]) -> None:
+    """Persist ONLY step-completion flags to *partial_path* -- never key
+    values."""
+    p = Path(partial_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        json.dumps({"steps_done": list(steps_done)}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def clear_setup_checkpoint(partial_path: "str | Path") -> None:
+    """Remove the resume checkpoint once every resumable step has completed
+    in a single run. Best-effort: a failure to delete never fails setup."""
+    try:
+        Path(partial_path).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 - cleanup must never crash a finished setup
+        pass
 
 
 def check_dependencies() -> List[Tuple[str, str, bool]]:
@@ -275,6 +365,50 @@ def check_gemini(api_key: str) -> Tuple[bool, str]:
     return True, "модель ответила, ключ рабочий"
 
 
+def discover_gemini_models(api_key: str) -> List[str]:
+    """List Gemini models that support ``generateContent``, names stripped
+    of their ``models/`` prefix (B6).
+
+    Same request shape as ``plugins/hermes-setup/registry.py``'s
+    ``_live_check_gemini_key`` (``GET .../v1beta/models?key=...``, browser
+    UA, one attempt, no retries) but this one actually parses the body,
+    which that function doesn't need to do. Never raises: any network
+    error, non-200 status, or malformed JSON just yields an empty list, and
+    :func:`_step_gemini_model` falls back to the compiled-in default model
+    on an empty result -- B6's "грациозный фолбэк".
+    """
+    import requests  # heavy/optional import kept local (plugin convention)
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        resp = requests.get(
+            url, headers={"User-Agent": DEFAULT_USER_AGENT}, timeout=LIVE_CHECK_TIMEOUT_S,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+    except Exception:  # noqa: BLE001 - discovery is best-effort, never fatal to setup
+        return []
+
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+
+    out: List[str] = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        methods = m.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        name = str(m.get("name") or "")
+        if name.startswith("models/"):
+            name = name[len("models/"):]
+        if name:
+            out.append(name)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Interactive flow
 # ---------------------------------------------------------------------------
@@ -297,18 +431,51 @@ def _yes(input_fn, prompt: str) -> bool:
     return not answer.startswith(("n", "н"))
 
 
+def _yes_default_no(input_fn, prompt: str) -> bool:
+    """Opposite default of :func:`_yes`: Enter/empty = НЕТ; only an explicit
+    "да"/"y"/"д" counts as yes (B8). Used exactly where an Enter-happy user
+    must never silently opt into a risky action -- keeping a key that just
+    failed its live check."""
+    answer = (input_fn(prompt) or "").strip().lower()
+    return answer.startswith(("y", "д"))
+
+
 def _confirm_after_check(run_check, input_fn) -> bool:
     """Offer a live check. Returns True if the entered values should be kept
-    (check skipped, check passed, or check failed but the user insists)."""
+    (check skipped, check passed, or check failed but the user explicitly
+    insists on saving anyway).
+
+    The two gates have DELIBERATELY different defaults (B8): gate 1 (offer a
+    check at all) defaults to Enter = да -- checking is free and safe, so an
+    Enter-happy user should get it. Gate 2 (keep a key that just FAILED its
+    check) defaults to Enter = НЕТ (:func:`_yes_default_no`) -- an Enter-
+    happy user must never silently save a key already known to be broken.
+    """
     if not _yes(input_fn, "Проверить живым запросом? (Enter = да / n = нет): "):
         print("Хорошо, проверять не будем -- просто сохраним.")
+        print("Ключ сохранится без проверки -- если он битый, память молча не заработает.")
         return True
     ok, msg = run_check()
     if ok:
         print(f"Проверка прошла: {msg}.")
         return True
     print(f"Проверка не прошла: {msg}.")
-    return _yes(input_fn, "Сохранить всё равно? (Enter = да / n = не сохранять): ")
+    return _yes_default_no(
+        input_fn,
+        "Сохранить ключ несмотря на ошибку? (Enter = не сохранять / «да» = сохранить): ",
+    )
+
+
+def _write_step_values(env_path: Path, values: Dict[str, str]) -> None:
+    """Immediately persist one step's collected keys to .env and print the
+    same per-key confirmation line the old end-of-run loop used to print in
+    bulk (B4). Writing right after each step -- instead of batching every
+    step's keys until the very end of ``_run`` -- is what stops an
+    EOFError/KeyboardInterrupt on a LATER step from losing an EARLIER step's
+    already-confirmed keys."""
+    for key, value in values.items():
+        action = upsert_env_var(env_path, key, value)
+        print(f"  {key} = {mask_key(value)} -- {_ACTION_RU.get(action, action)} в {env_path}")
 
 
 _CF_SKIP_MSG = "Пропущено: память будет искать только по словам (FTS), без поиска по смыслу."
@@ -422,6 +589,35 @@ def _step_gemini(input_fn) -> Tuple[Dict[str, str], str]:
     )
 
 
+def _step_gemini_model(input_fn, api_key: str) -> str:
+    """After a Gemini key has been entered and kept, offer to pick the
+    extraction/consolidation model from Gemini's live ListModels response
+    instead of blindly trusting the compiled-in default (B6). Returns the
+    model id to use. Never prompts at all when discovery comes back empty --
+    nothing to choose from means nothing to ask, just the graceful fallback.
+    """
+    print()
+    print("Проверяю список доступных моделей Gemini (ListModels)...")
+    models = discover_gemini_models(api_key)
+    if not models:
+        print(f"Не удалось получить список моделей -- оставляю модель по умолчанию ({GEMINI_MODEL}).")
+        return GEMINI_MODEL
+
+    default = GEMINI_MODEL if GEMINI_MODEL in models else models[0]
+    print("Доступные модели (поддерживают generateContent):")
+    for i, name in enumerate(models, start=1):
+        marker = " -- по умолчанию" if name == default else ""
+        print(f"  {i}. {name}{marker}")
+
+    answer = (input_fn(f"Номер модели (Enter = {default}): ") or "").strip()
+    if not answer:
+        return default
+    if not answer.isdigit() or not (1 <= int(answer) <= len(models)):
+        print("Не похоже на номер из списка -- использую модель по умолчанию.")
+        return default
+    return models[int(answer) - 1]
+
+
 def _step_dependencies() -> Tuple[List[str], str]:
     print()
     print("Шаг 4 из 4 -- проверка зависимостей (python-библиотек).")
@@ -454,6 +650,7 @@ def _resolve_hermes_home(hermes_home: Optional[str]) -> str:
 def _run(hermes_home: Optional[str], input_fn) -> None:
     home = _resolve_hermes_home(hermes_home)
     env_path = Path(home) / ".env"
+    partial_path = Path(home) / PARTIAL_SETUP_FILENAME
 
     print("Настройка памяти MemoHood.")
     print()
@@ -463,39 +660,117 @@ def _run(hermes_home: Optional[str], input_fn) -> None:
     print(f"без ключей, просто скромнее. Ключи будут записаны в {env_path};")
     print("в консоли они никогда не показываются целиком.")
 
+    # B10: resume checkpoint. Holds ONLY step-completion flags (never key
+    # values) -- see load_setup_checkpoint's docstring.
+    steps_done: List[str] = load_setup_checkpoint(partial_path)
+    if steps_done:
+        print()
+        labels = ", ".join(_STEP_LABELS.get(s, s) for s in steps_done)
+        print(f"Найден незавершённый предыдущий запуск. Уже готово: {labels}.")
+        if not _yes(input_fn, "Продолжить и пропустить готовые шаги? (Enter = да / n = начать заново): "):
+            steps_done = []
+
     to_write: Dict[str, str] = {}
     summary: List[Tuple[str, str]] = []
 
-    values, status = _step_cloudflare(input_fn)
-    to_write.update(values)
-    summary.append(("Cloudflare (эмбеддинги)", status))
+    try:
+        if "cloudflare" in steps_done:
+            summary.append(("Cloudflare (эмбеддинги)", "уже настроено ранее -- пропущено при возобновлении"))
+        else:
+            values, status = _step_cloudflare(input_fn)
+            to_write.update(values)
+            summary.append(("Cloudflare (эмбеддинги)", status))
+            if values:  # B4: write THIS step's keys immediately, don't batch until the end
+                print()
+                _write_step_values(env_path, values)
+            steps_done.append("cloudflare")
+            save_setup_checkpoint(partial_path, steps_done)
 
-    values, status = _step_cohere(input_fn)
-    to_write.update(values)
-    summary.append(("Cohere (реранк)", status))
+        if "cohere" in steps_done:
+            summary.append(("Cohere (реранк)", "уже настроено ранее -- пропущено при возобновлении"))
+        else:
+            values, status = _step_cohere(input_fn)
+            to_write.update(values)
+            summary.append(("Cohere (реранк)", status))
+            if values:
+                print()
+                _write_step_values(env_path, values)
+            steps_done.append("cohere")
+            save_setup_checkpoint(partial_path, steps_done)
 
-    values, status = _step_gemini(input_fn)
-    to_write.update(values)
-    summary.append(("Gemini (факты)", status))
+        if "gemini" in steps_done:
+            summary.append(("Gemini (факты)", "уже настроено ранее -- пропущено при возобновлении"))
+        else:
+            values, status = _step_gemini(input_fn)
+            to_write.update(values)
+            summary.append(("Gemini (факты)", status))
+            if values:
+                print()
+                _write_step_values(env_path, values)
+            # Mark "gemini" done (key already safely in .env) BEFORE the
+            # optional model-choice prompt below, so an EOFError/
+            # KeyboardInterrupt during model selection still lets a resumed
+            # run skip re-asking the key it already has.
+            steps_done.append("gemini")
+            save_setup_checkpoint(partial_path, steps_done)
 
-    _missing, deps_status = _step_dependencies()
-    summary.append(("Зависимости", deps_status))
+            if values:  # B6: only worth discovering a model if we HAVE a key
+                chosen_model = _step_gemini_model(input_fn, values["GEMINI_API_KEY"])
+                if chosen_model != GEMINI_MODEL:
+                    try:
+                        memohood_config.save_memohood_config_at({"model.model": chosen_model}, home)
+                        summary.append(("Модель Gemini", f"выбрана {chosen_model}"))
+                    except Exception:  # noqa: BLE001 - config write must degrade, not crash setup
+                        summary.append(("Модель Gemini", f"не удалось сохранить выбор, останется {GEMINI_MODEL}"))
+                else:
+                    summary.append(("Модель Gemini", f"по умолчанию ({GEMINI_MODEL})"))
+
+        _missing, deps_status = _step_dependencies()
+        summary.append(("Зависимости", deps_status))
+
+        if all(step in steps_done for step in RESUMABLE_STEPS):
+            clear_setup_checkpoint(partial_path)
+    except (EOFError, KeyboardInterrupt):
+        # Belt-and-suspenders (B4): every step above already writes its OWN
+        # keys to .env the moment it completes, so `to_write` here normally
+        # already mirrors what's on disk -- but re-flushing it before we
+        # propagate is cheap and idempotent (upsert_env_var just replaces
+        # the same line), so a future refactor that reintroduces batching
+        # can't silently regress into "Ctrl+D loses already-confirmed keys".
+        if to_write:
+            for key, value in to_write.items():
+                upsert_env_var(env_path, key, value)
+        raise
 
     print()
-    if to_write:
-        for key, value in to_write.items():
-            action = upsert_env_var(env_path, key, value)
-            print(f"  {key} = {mask_key(value)} -- {_ACTION_RU.get(action, action)} в {env_path}")
-    else:
-        print(f"Ни одного ключа не введено -- {env_path} не тронут.")
+    if not to_write:
+        if env_path.exists():
+            print(f"Новых ключей в этом запуске не введено -- {env_path} оставлен как есть.")
+        else:
+            print(f"Ни одного ключа не введено -- {env_path} не тронут.")
 
     print()
     print("Итоги:")
     for name, status in summary:
         print(f"  {name}: {status}")
+
+    # B12: idempotently point a systemd-hosted gateway unit at
+    # HERMES_HOME/.env (no-op off systemd -- see systemd_env's own guard) so
+    # the hint below can honestly tell a systemd user that a plain restart
+    # is enough, instead of the CLI-session phrasing that doesn't apply to
+    # them. Never raises -- a write/reload failure just degrades to the
+    # generic hint below, same as "not systemd at all".
+    systemd_wired, _systemd_msg = systemd_env.wire_gateway_env(home)
+
     print()
     print("Что дальше:")
-    print("  1. Перезапустите hermes, чтобы он подхватил ключи из .env.")
+    if systemd_wired:
+        print(
+            "  1. Перезапустите gateway: hermes gateway restart -- ключи из .env "
+            "подхватятся (systemd EnvironmentFile настроен)."
+        )
+    else:
+        print("  1. Перезапустите hermes, чтобы он подхватил ключи из .env.")
     print("  2. Спросите бота: «что ты обо мне помнишь?»")
 
 

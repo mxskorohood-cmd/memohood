@@ -22,7 +22,7 @@ provider.py          # MemoHoodMemoryProvider(MemoryProvider) — full ABC impl
 db.py                # memory.db schema; WAL, busy_timeout, synchronous=NORMAL; catch_up_from_state (watermark)
 capture.py           # two-stage fact extraction: keyword signals (free) + Gemini borderline; supersede 3-tier; pinned tier
 consolidate.py       # nightly rollup (day→week→month), Ebbinghaus decay per-kind (pinned exempt), anti-loop flag
-extract_llm.py       # Gemini gemini-2.5-flash-lite via OpenAI-compat REST (generativelanguage.../v1beta/openai/), GEMINI_API_KEY, browser UA
+extract_llm.py       # Gemini gemini-3.1-flash-lite via OpenAI-compat REST (generativelanguage.../v1beta/openai/), GEMINI_API_KEY, browser UA
 query_norm.py        # _meaningful_terms: strip RU/EN stopwords/pronouns/question-words, keep CamelCase/UPPER_SNAKE/digits/paths; RU-aware
 tools.py             # memohood_search, memohood_fetch, memohood_recall(recall_memory), memohood_stats, memohood_capture(manual)
 cli.py               # hermes memohood status|stats|reindex|seed
@@ -81,7 +81,7 @@ memory:
   provider: memohood
   memohood:
     gate: {backend: pass}                 # pass-through v1; model2vec later
-    model: {provider: gemini, model: gemini-2.5-flash-lite}   # extraction/consolidation
+    model: {provider: gemini, model: gemini-3.1-flash-lite}   # extraction/consolidation
     embedder: {provider: cloudflare, model: "@cf/baai/bge-m3", dims: 1024}   # reuse kb keys
     rerank: {provider: cohere, enabled: true}
     auto_capture: true

@@ -432,7 +432,7 @@ class MemoHoodMemoryProvider(MemoryProvider):
             {"key": "graph_rerank.enabled", "description": "Буст+добор воспоминаний по графу связанных сессий (session_links)", "default": True, "choices": [True, False]},
             {"key": "graph_rerank.max_neighbors", "description": "graph_rerank: макс. число новых воспоминаний из связанных сессий за раз", "default": 3},
             {"key": "model.provider", "description": "Провайдер LLM для извлечения/консолидации", "default": "gemini"},
-            {"key": "model.model", "description": "Модель для извлечения/консолидации", "default": "gemini-2.5-flash-lite"},
+            {"key": "model.model", "description": "Модель для извлечения/консолидации", "default": "gemini-3.1-flash-lite"},
             {"key": "embedder.provider", "description": "Провайдер эмбеддингов для captures", "default": "cloudflare"},
             {"key": "embedder.model", "description": "Модель эмбеддингов", "default": "@cf/baai/bge-m3"},
             {"key": "embedder.dims", "description": "Размерность эмбеддинга", "default": 1024},

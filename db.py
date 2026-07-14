@@ -491,23 +491,147 @@ def vec_table_exists(conn: sqlite3.Connection, *, shadow: bool = False) -> bool:
     return row is not None
 
 
-def swap_vec_table(conn: sqlite3.Connection) -> None:
+# vec0 (sqlite-vec) backs each virtual table with four internal "shadow"
+# tables -- ``{name}_rowids`` / ``_chunks`` / ``_info`` / ``_vector_chunks00``
+# (verified against the installed sqlite-vec v0.1.9). ``vec0`` implements no
+# ``xRename`` callback, so ``ALTER TABLE ... RENAME`` does NOT rename these
+# along with the virtual table -- the root of B11. A table left behind by the
+# pre-B11 rename-based swap therefore points at shadow tables that no longer
+# carry its name, and even a plain ``DROP TABLE`` on it fails with a bare "SQL
+# logic error" because the engine's destructor cannot find them -- which would
+# brick the very reindex meant to repair it. :func:`safe_drop_vec_table` heals
+# that state.
+_VEC_SHADOW_SUFFIXES = ("_rowids", "_chunks", "_info", "_vector_chunks00")
+
+
+def _vec_shadow_stub_ddl(table: str, suffix: str) -> str:
+    """``CREATE TABLE IF NOT EXISTS`` for one vec0 internal shadow table,
+    reproducing sqlite-vec v0.1.9's REAL column layout (verified empirically
+    against the installed extension).
+
+    The real schema -- not a minimal ``(x)`` placeholder -- is required:
+    vec0's ``DROP TABLE`` destructor actually reads ``_info(key, value)`` and
+    ``_chunks`` while tearing down, so a wrong-shaped stub still makes the
+    drop fail with "SQL logic error". These stubs exist only to give the
+    engine enough of a shadow table to complete its own teardown of an
+    already-corrupt table; their contents are irrelevant (the table is being
+    dropped)."""
+    name = f"{table}{suffix}"
+    columns = {
+        "_rowids": "rowid INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, "
+                   "chunk_id INTEGER, chunk_offset INTEGER",
+        "_chunks": "chunk_id INTEGER PRIMARY KEY AUTOINCREMENT, size INTEGER NOT NULL, "
+                   "validity BLOB NOT NULL, rowids BLOB NOT NULL",
+        "_info": "key TEXT PRIMARY KEY, value ANY",
+        "_vector_chunks00": "rowid PRIMARY KEY, vectors BLOB NOT NULL",
+    }[suffix]
+    return f'CREATE TABLE IF NOT EXISTS "{name}" ({columns})'
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Like :func:`vec_table_exists` but for an arbitrary table name (used
+    internally for the ``{table}_v2`` sibling and orphan-shadow checks)."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _drop_orphan_vec_shadows(conn: sqlite3.Connection, base: str) -> None:
+    """Drop any leftover vec0 internal shadow tables of ``base`` -- the plain
+    tables ``{base}_rowids`` / ``_chunks`` / ``_info`` and every numbered
+    ``{base}_vector_chunksNN``. Once their parent vec0 table is gone these are
+    ordinary tables, so a plain ``DROP TABLE IF EXISTS`` removes them. The
+    explicit-suffix match deliberately does NOT touch a ``{base}_v2*`` sibling
+    (``captures_vec_rowids`` != ``captures_vec_v2_rowids``)."""
+    for suffix in ("_rowids", "_chunks", "_info"):
+        conn.execute(f'DROP TABLE IF EXISTS "{base}{suffix}"')
+    for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ?",
+        (f"{base}_vector_chunks%",),
+    ).fetchall():
+        conn.execute(f'DROP TABLE IF EXISTS "{row[0]}"')
+
+
+def safe_drop_vec_table(conn: sqlite3.Connection, table: str) -> None:
+    """Drop a vec0 virtual table, tolerating one left CORRUPT by a pre-B11
+    ``ALTER TABLE ... RENAME``-based swap (see :data:`_VEC_SHADOW_SUFFIXES`
+    for why such a table exists and why a bare ``DROP TABLE`` on it fails).
+
+    Idempotent -- a no-op when ``table`` and its shadow leftovers are already
+    gone. Crucially it NEVER attempts a bare ``DROP TABLE`` on a
+    possibly-corrupt table first: a FAILED vec0 drop POISONS the connection
+    so that every subsequent recovery drop on it ALSO fails (verified against
+    sqlite-vec 0.1.9). Instead it (re)creates any MISSING internal shadow
+    tables with their real schema -- a no-op for a healthy table, whose
+    shadows already exist, and gap-fill for a corrupt one -- so the engine's
+    own destructor can always run; then it drops the table; then it sweeps
+    orphaned shadow leftovers of both ``table`` and its ``{table}_v2``
+    sibling. The sibling is swept ONLY when it is not itself a live vec0
+    table, so an in-progress shadow (present during ``swap_vec_table``) is
+    never destroyed.
+
+    Runs in the CALLER's transaction context (it does NOT open its own
+    ``with conn:``), so it can be nested inside ``swap_vec_table``'s single
+    atomic swap. Raises :class:`DbError` (never a bare ``sqlite3.Error``) so
+    CLI/embed callers can catch one error type.
+    """
+    try:
+        if _table_exists(conn, table):
+            for suffix in _VEC_SHADOW_SUFFIXES:
+                conn.execute(_vec_shadow_stub_ddl(table, suffix))
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        _drop_orphan_vec_shadows(conn, table)
+        sibling = f"{table}_v2"
+        if not _table_exists(conn, sibling):
+            _drop_orphan_vec_shadows(conn, sibling)
+    except sqlite3.Error as exc:
+        raise DbError(f"failed to drop vec table {table}: {exc}") from exc
+
+
+def swap_vec_table(conn: sqlite3.Connection, dims: int) -> None:
     """Atomically promote the shadow table (``captures_vec_v2``) to live
     (``captures_vec``), for the embedding-migration flow in
     ``_engine/embed.py``'s ``reembed_captures_shadow``. Caller is
     responsible for having fully re-embedded into the shadow table BEFORE
-    calling this -- this function only does the rename, inside one
-    transaction so readers never observe a half-swapped state.
+    calling this.
+
+    Does NOT use ``ALTER TABLE ... RENAME`` -- sqlite-vec's ``vec0`` virtual
+    table module does not implement ``xRename`` (SQLite's virtual-table
+    rename callback), so renaming a vec0 table leaves it corrupt under its
+    new name (B11). Instead this (re)creates the live table under its
+    permanent name and copies rows across from the shadow table via a
+    single ``INSERT ... SELECT``, then drops the shadow table -- all inside
+    one transaction so readers never observe a half-swapped state.
+
+    ``dims`` must match the shadow table's embedding dimensionality (the
+    caller already knows it -- it is whatever was passed to
+    ``ensure_vec_table(..., shadow=True)`` for this same migration).
+
+    The old live table is removed via :func:`safe_drop_vec_table`, not a bare
+    ``DROP TABLE``, so that a live table left CORRUPT by a pre-B11
+    rename-based swap (whose plain drop would fail and brick the reindex) is
+    still recovered here.
     """
+    if not isinstance(dims, int) or dims <= 0:
+        raise DbError(f"invalid dims for captures_vec table: {dims!r}")
     live = vec_table_name(shadow=False)
     shadow = vec_table_name(shadow=True)
     if not vec_table_exists(conn, shadow=True):
         raise DbError(f"cannot swap: shadow table {shadow} does not exist")
     try:
         with conn:
-            if vec_table_exists(conn, shadow=False):
-                conn.execute(f"DROP TABLE {live}")
-            conn.execute(f"ALTER TABLE {shadow} RENAME TO {live}")
+            safe_drop_vec_table(conn, live)
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {live} USING vec0("
+                f"capture_id TEXT PRIMARY KEY, embedding FLOAT[{dims}])"
+            )
+            conn.execute(
+                f"INSERT INTO {live}(capture_id, embedding) "
+                f"SELECT capture_id, embedding FROM {shadow}"
+            )
+            conn.execute(f"DROP TABLE {shadow}")
     except sqlite3.Error as exc:
         raise DbError(f"failed to swap captures_vec tables: {exc}") from exc
 

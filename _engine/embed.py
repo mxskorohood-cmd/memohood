@@ -374,6 +374,16 @@ def reembed_captures_shadow(
 
     _set_migration_state(conn, "migrating")
     try:
+        # Drop any stale shadow table left behind by a previous FAILED
+        # reindex before (re)creating it. Uses `db.safe_drop_vec_table` (not a
+        # bare DROP) and calls it UNCONDITIONALLY: a pre-B11 crash can leave
+        # the shadow's vec0 internal tables (`captures_vec_v2_rowids` etc.)
+        # ORPHANED with no matching virtual-table entry, so a `vec_table_exists`
+        # guard would skip them and the `ensure_vec_table` below would then
+        # fail with "table captures_vec_v2_rowids already exists".
+        # safe_drop_vec_table also heals a shadow left corrupt (not just stale).
+        with conn:
+            db.safe_drop_vec_table(conn, db.vec_table_name(shadow=True))
         vec_ready = db.ensure_vec_table(conn, dims, shadow=True)
         captures = conn.execute(
             "SELECT id, content FROM captures WHERE invalidated_at IS NULL ORDER BY id",
@@ -393,7 +403,7 @@ def reembed_captures_shadow(
                             (row["id"], serialize_vector(vec)),
                         )
                 embedded_count += len(batch)
-            db.swap_vec_table(conn)
+            db.swap_vec_table(conn, dims)
         else:
             logger.warning(
                 "sqlite-vec unavailable; captures migration updates embedder config/"

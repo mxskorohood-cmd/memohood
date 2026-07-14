@@ -6,9 +6,13 @@
 # from the host loader on first activation (hermes_cli/memory_setup.py) --
 # this script installs the same packages up front so the very first
 # `hermes memohood status` after restart doesn't have to hit the network
-# mid-session, copies the plugin into place, and switches
-# `memory.provider: memohood` in config.yaml for you -- no manual copy,
-# no manual config.yaml edit.
+# mid-session, copies the plugin into place, switches
+# `memory.provider: memohood` in config.yaml for you, and -- if hermes runs
+# as a systemd --user gateway unit -- wires that unit to read
+# HERMES_HOME/.env via a drop-in override (see systemd_env.py) so
+# `hermes gateway restart` actually picks up keys written by
+# `hermes memohood setup`. No manual copy, no manual config.yaml edit, no
+# manual systemd unit edit.
 #
 # Package list == plugin.yaml's pip_dependencies (all MIT/BSD/Apache, no
 # torch): sqlite-vec PyStemmer ftfy requests model2vec
@@ -285,4 +289,11 @@ if [ "$INSTALL_LOCAL" = "1" ]; then
 else
     echo "Офлайн-вектор без Cloudflare: переустановите с флагом --local"
 fi
+
+# --- Wire the systemd user gateway to read HERMES_HOME/.env (B12) ----------
+# No-op unless hermes runs as a systemd --user unit (hermes-gateway.service)
+# -- see systemd_env.py's own detect_systemd_gateway() guard. `|| true`
+# because a failure here must never fail the whole install.
+"$PYTHON" "$TARGET_DIR/systemd_env.py" "$HERMES_HOME_RESOLVED" || true
+
 echo "Перезапустите hermes, затем проверьте: hermes memohood status"

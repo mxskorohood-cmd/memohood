@@ -46,7 +46,7 @@ class TestSignalScoring:
     def test_borderline_band_calls_extract_exactly_once(self, memohood, monkeypatch):
         calls = []
 
-        def fake_extract(text, *, conn=None):
+        def fake_extract(text, *, model=None, conn=None):
             calls.append(text)
             return {
                 "is_memorable": True, "kind": "preference",
@@ -68,7 +68,7 @@ class TestSignalScoring:
         conn.close()
 
     def test_borderline_not_memorable_drops(self, memohood, monkeypatch):
-        def fake_extract(text, *, conn=None):
+        def fake_extract(text, *, model=None, conn=None):
             return {
                 "is_memorable": False, "kind": "fact",
                 "notability": "low", "source_type": "INFERRED", "pinned": False,
@@ -146,7 +146,7 @@ class TestSupersede:
         def fake_nearest(conn_, content, cfg, *, k=5):
             return [{"id": old_id, "content": "мы используем MySQL", "cosine": 0.93}], None
 
-        def fake_judge(new_content, candidates, *, conn=None):
+        def fake_judge(new_content, candidates, *, model=None, conn=None):
             return {"action": "supersede", "supersedes_id": old_id, "reasoning": "updated decision"}
 
         monkeypatch.setattr(memohood.capture, "_nearest_captures", fake_nearest)
@@ -228,7 +228,7 @@ class TestProcessTurnIsolation:
         # LLM gate rather than crafting a multi-pattern-match string.
         monkeypatch.setattr(
             memohood.extract_llm, "extract",
-            lambda text, *, conn=None: {
+            lambda text, *, model=None, conn=None: {
                 "is_memorable": True, "kind": "fact", "notability": "medium",
                 "source_type": "EXTRACTED", "pinned": False,
             },

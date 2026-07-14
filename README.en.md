@@ -118,6 +118,8 @@ flowchart LR
 
 Restart hermes — memory already works, in keyword mode: signals like "remember this," "we decided," "actually" get captured for free, no external call involved.
 
+If hermes runs as a systemd service (gateway) for you, keys from `.env` are picked up after `hermes gateway restart` — the installer already wires a systemd drop-in (`EnvironmentFile`) for that. In an interactive CLI session, `.env` is picked up on its own: the process inherits the environment it was started from.
+
 **2. Keys — optional, for semantic search.** Without them, memory only matches on exact words; to turn on search by meaning (embeddings + rerank) and borderline-fact extraction, add the keys to the `.env` file next to `config.yaml` (`~/.hermes/.env`, on Windows `%LOCALAPPDATA%\hermes\.env`). The easiest way is the terminal onboarding wizard:
 
 ```
@@ -157,7 +159,7 @@ Every key below is set in `config.yaml` under the `memory.memohood.` prefix, e.g
 | `gate.model2vec_model` | string | `minishlab/potion-base-8M` | Static embedding model used by the gate |
 | `gate.meaningful_terms_floor` | int | `3` | If the query has this many meaningful words or more, recall immediately, no embedding needed |
 | `model.provider` | string | `gemini` | LLM provider used for borderline fact extraction and nightly consolidation |
-| `model.model` | string | `gemini-2.5-flash-lite` | The specific model used for extraction and consolidation |
+| `model.model` | string | `gemini-3.1-flash-lite` | The specific model used for extraction and consolidation |
 | `embedder.provider` | string | `cloudflare` | Embedding provider for the vector search leg |
 | `embedder.model` | string | `@cf/baai/bge-m3` | Embedding model |
 | `embedder.dims` | int | `1024` | Vector dimensionality |
