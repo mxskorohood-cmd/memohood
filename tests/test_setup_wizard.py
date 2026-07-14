@@ -135,15 +135,20 @@ class TestValidators:
     def test_api_token_garbage(self, memohood, value):
         assert _wizard(memohood).validate_api_token(value) is False
 
-    @pytest.mark.parametrize("value", ["AIza" + "x" * 35, "AIzaSyFakeFakeFakeFakeFake"])
+    @pytest.mark.parametrize(
+        "value",
+        ["AIza" + "x" * 35, "AIzaSyFakeFakeFakeFakeFake", "AQ." + "b" * 50],
+    )
     def test_gemini_key_valid(self, memohood, value):
+        # No provider-prefix requirement -- the legacy AIza... shape, the
+        # newer AQ.... shape, and anything else plausible are all accepted;
+        # the live check (not this format gate) is the real validator.
         assert _wizard(memohood).validate_gemini_key(value) is True
 
     @pytest.mark.parametrize(
         "value",
         [
             "",
-            "sk-not-a-gemini-key-000000000000",  # wrong prefix
             "AIza",  # too short
             "AIza key with spaces 000000000000",  # whitespace
         ],

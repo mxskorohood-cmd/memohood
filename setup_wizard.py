@@ -92,9 +92,11 @@ def validate_api_token(value: str) -> bool:
 
 
 def validate_gemini_key(value: str) -> bool:
-    """Gemini API key: starts with ``AIza``, no whitespace, plausible length."""
+    """Gemini API key: non-empty, no whitespace, plausible length. Google now
+    issues keys in more than one shape (legacy ``AIza…`` and newer ``AQ.…``),
+    so we don't gate on the prefix -- the live check is the real validator."""
     v = (value or "").strip()
-    return v.startswith("AIza") and len(v) >= 20 and not any(ch.isspace() for ch in v)
+    return bool(v) and 8 <= len(v) <= 200 and not any(ch.isspace() for ch in v)
 
 
 def mask_key(value: str) -> str:
@@ -409,12 +411,12 @@ def _step_gemini(input_fn) -> Tuple[Dict[str, str], str]:
             "Шаг 3 из 4 -- Gemini (LLM для фактов).",
             "Это младший редактор: решает судьбу спорных фактов и делает ночную",
             "уборку памяти. Модель flash-lite -- копеечная.",
-            "Ключ: aistudio.google.com/apikey (начинается с AIza).",
+            "Ключ: aistudio.google.com/apikey (бывает вида AIza… или AQ.…).",
         ),
         env_var="GEMINI_API_KEY",
         prompt="GEMINI_API_KEY (Enter = пропустить): ",
         validate=validate_gemini_key,
-        invalid_msg="Ключ Gemini обычно начинается с «AIza» и не содержит пробелов.",
+        invalid_msg="Ключ Gemini не должен содержать пробелов и быть разумной длины.",
         check_name="check_gemini",
         skip_msg=_GEMINI_SKIP_MSG,
     )
