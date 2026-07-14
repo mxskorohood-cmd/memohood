@@ -85,16 +85,24 @@ resolve_hermes_venv_python() {
         fi
     fi
 
-    # Fall back to the conventional HERMES_HOME/hermes-agent/venv layout.
-    local hermes_home="${HERMES_HOME:-$HOME/.hermes}"
-    local candidate="$hermes_home/hermes-agent/venv/bin/python"
-    if [ -x "$candidate" ]; then
-        echo "$candidate"
-        return 0
-    fi
+    # Fall back to conventional layouts. Try both default HERMES_HOME locations
+    # and both venv layouts -- POSIX (bin/python) and Windows (Scripts/python.exe) --
+    # so running install.sh from Git Bash on Windows also resolves the venv.
+    local h sub cand
+    for h in "${HERMES_HOME:-}" "$HOME/.hermes" "$HOME/AppData/Local/hermes"; do
+        [ -n "$h" ] || continue
+        for sub in venv/bin/python venv/Scripts/python.exe .venv/bin/python .venv/Scripts/python.exe; do
+            cand="$h/hermes-agent/$sub"
+            if [ -x "$cand" ] || [ -f "$cand" ]; then
+                echo "$cand"
+                return 0
+            fi
+        done
+    done
 
     echo "Не удалось найти python интерпретатор hermes-agent venv автоматически." >&2
     echo "Укажите его явно: ./install.sh /path/to/hermes-agent/venv/bin/python" >&2
+    echo "(на Windows/Git Bash — .../hermes-agent/venv/Scripts/python.exe)" >&2
     echo "или задайте переменную окружения HERMES_VENV_PYTHON." >&2
     return 1
 }
