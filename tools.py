@@ -195,6 +195,15 @@ def memohood_stats(args: Dict[str, Any], *, conn: Any, cfg: Dict[str, Any], sess
             lines.append(f"Расход за 30 дней ({provider}): ${spent:.4f} из ${ceiling_f:.2f}")
         except (TypeError, ValueError):
             lines.append(f"Расход за 30 дней ({provider}): ${spent:.4f}")
+
+    try:
+        from . import setup_wizard
+        block = setup_wizard.format_keys_block(cfg)
+        if block:
+            lines.append("")
+            lines.append(block)
+    except Exception:  # noqa: BLE001 - keys block must never break stats
+        logger.debug("memohood_stats: keys block render failed", exc_info=True)
     return "\n".join(lines)
 
 

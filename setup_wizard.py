@@ -53,7 +53,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Endpoint/model constants are imported from the modules that actually make
 # the production calls, so a wizard live-check always tests the very same
@@ -645,6 +645,128 @@ def _resolve_hermes_home(hermes_home: Optional[str]) -> str:
         return str(get_hermes_home())
     except Exception:  # noqa: BLE001 - standalone/dev run outside a hermes install
         return str(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+# ---------------------------------------------------------------------------
+# Key visibility (read side) — lets `hermes memohood stats` SHOW which keys
+# are configured, where the .env lives, and whether the RUNNING process has
+# actually picked them up (systemd bug B12), without printing a full secret
+# or making a network call. The write side is upsert_env_var/_write_step_values.
+# ---------------------------------------------------------------------------
+
+# Same line grammar upsert_env_var respects: optional indent, optional ``#``
+# comment prefix, KEY, ``=``, value. Commented/empty-valued lines don't count.
+_ENV_LINE_RE = re.compile(
+    r"^(?P<indent>\s*)(?P<hash>#+\s*)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=(?P<rest>.*)$"
+)
+
+
+def env_file_path(hermes_home: Optional[str] = None) -> Path:
+    """``<HERMES_HOME>/.env`` — the single file memohood's keys live in. Surfaced
+    so stats/onboarding can SHOW the path instead of making a human hunt for it."""
+    return Path(_resolve_hermes_home(hermes_home)) / ".env"
+
+
+def _read_env_file_values(env_path: Path) -> Dict[str, str]:
+    """``{KEY: value}`` for every ACTIVE (uncommented, non-empty) line in
+    *env_path*. Reads once; never raises (missing/unreadable file -> ``{}``)."""
+    result: Dict[str, str] = {}
+    try:
+        if not env_path.exists():
+            return result
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return result
+    for line in text.splitlines():
+        m = _ENV_LINE_RE.match(line)
+        if not m or m.group("hash"):
+            continue
+        val = m.group("rest").strip()
+        if val:
+            result[m.group("key")] = val
+    return result
+
+
+def key_status(env_vars: List[str], *, hermes_home: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Read-only status of each var: ``{VAR: {"in_file","in_process","mask"}}``.
+
+    ``in_process`` reflects what the RUNNING hermes sees (``os.environ``); a key
+    present in the file but NOT here means the gateway started before it was
+    added and needs a restart (bug B12). ``mask`` is :func:`mask_key`'s
+    first-4-chars form (process value preferred, else file), never the full
+    secret. Never raises."""
+    file_vals = _read_env_file_values(env_file_path(hermes_home))
+    out: Dict[str, Dict[str, Any]] = {}
+    for var in env_vars:
+        file_val = file_vals.get(var)
+        proc_raw = os.environ.get(var)
+        proc_val = proc_raw if (proc_raw and proc_raw.strip()) else None
+        shown = proc_val or file_val
+        out[var] = {
+            "in_file": bool(file_val),
+            "in_process": bool(proc_val),
+            "mask": mask_key(shown) if shown else "",
+        }
+    return out
+
+
+def relevant_keys(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Ordered catalog of the ``.env`` keys memohood uses, from effective config:
+    embedder keys (cloudflare -> account+token, local -> none), optional cohere
+    rerank, optional gemini extraction. Each item ``{"env_var","role","required"}``."""
+    cfg = cfg or {}
+    embedder = ((cfg.get("embedder") or {}).get("provider")) or "cloudflare"
+    rerank = cfg.get("rerank") or {}
+    model = cfg.get("model") or {}
+    items: List[Dict[str, Any]] = []
+    if embedder == "cloudflare":
+        items.append({"env_var": "CLOUDFLARE_ACCOUNT_ID", "role": "поиск по смыслу (Cloudflare)", "required": True})
+        items.append({"env_var": "CLOUDFLARE_API_TOKEN", "role": "поиск по смыслу (Cloudflare)", "required": True})
+    elif embedder in ("openai", "openai-compat"):
+        items.append({"env_var": "OPENAI_API_KEY", "role": "поиск по смыслу (OpenAI-совм.)", "required": True})
+    # local embedder: no keys needed.
+    if rerank.get("enabled", True) and rerank.get("provider", "cohere") == "cohere":
+        items.append({"env_var": "COHERE_API_KEY", "role": "сортировка (Cohere)", "required": False})
+    if (model.get("provider", "gemini")) == "gemini":
+        items.append({"env_var": "GEMINI_API_KEY", "role": "извлечение фактов (Gemini)", "required": False})
+    return items
+
+
+def _restart_hint(hermes_home: Optional[str] = None) -> str:
+    """Read-only, systemd-aware restart phrasing for the stats "Ключи" block
+    (never wires anything — that's the wizard's job). Never raises."""
+    try:
+        under = systemd_env.detect_systemd_gateway()
+    except Exception:  # noqa: BLE001 - detection must never crash a status readout
+        under = False
+    if under:
+        return "перезапустите gateway: hermes gateway restart (systemd EnvironmentFile настроен)."
+    return "перезапустите hermes, чтобы подхватить ключи из .env."
+
+
+def format_keys_block(cfg: Dict[str, Any], *, hermes_home: Optional[str] = None) -> str:
+    """Render the read-only "Ключи" section for `hermes memohood stats`: the
+    ``.env`` path + one line per relevant key — ``✓ настроен`` / ``✗ нет`` / ``⚠``
+    when it is in the file but the running process hasn't picked it up. Never
+    prints a full secret; never makes a network call."""
+    catalog = relevant_keys(cfg)
+    statuses = key_status([c["env_var"] for c in catalog], hermes_home=hermes_home)
+    lines = [f"Ключи (.env: {env_file_path(hermes_home)}):"]
+    stale = False
+    for c in catalog:
+        var = c["env_var"]
+        st = statuses.get(var, {})
+        role = f"[{c['role']}{'' if c['required'] else ', опц.'}]"
+        if st.get("in_process"):
+            lines.append(f"  {var} — ✓ настроен ({st['mask']}) {role}")
+        elif st.get("in_file"):
+            stale = True
+            lines.append(f"  {var} — ⚠ есть в .env ({st['mask']}), но процесс не видит {role}")
+        else:
+            lines.append(f"  {var} — ✗ нет {role}")
+    if stale:
+        lines.append(f"  ⚠ Часть ключей записана, но не подхвачена процессом: {_restart_hint(hermes_home)}")
+    return "\n".join(lines)
 
 
 def _run(hermes_home: Optional[str], input_fn) -> None:

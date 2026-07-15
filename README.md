@@ -5,7 +5,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <a href="#быстрый-старт"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
   <a href="#быстрый-старт"><img alt="hermes-agent >=0.18" src="https://img.shields.io/badge/hermes--agent-%3E%3D0.18-blueviolet"></a>
-  <a href="tests/"><img alt="Tests: 181 passed" src="https://img.shields.io/badge/tests-181%20passed-brightgreen"></a>
+  <a href="tests/"><img alt="Tests: 247 passed, 1 skipped" src="https://img.shields.io/badge/tests-247%20passed-brightgreen"></a>
   <a href="README.en.md"><img alt="Docs: RU | EN" src="https://img.shields.io/badge/docs-RU%20%7C%20EN-informational"></a>
 </p>
 
@@ -145,7 +145,7 @@ Cloudflare нужен для векторного поиска (эмбеддин
 hermes memohood status
 ```
 
-Если плагин подхватился, вы увидите статистику памяти (пока пустую) и расход за 30 дней по каждому провайдеру — 0 из настроенного потолка.
+Если плагин подхватился, вы увидите статистику памяти (пока пустую) и расход за 30 дней по каждому провайдеру — 0 из настроенного потолка, а в конце — блок «Ключи»: полный путь к `.env` и статус каждого ключа (`✓ настроен` с маской / `✗ нет` / `⚠ есть в .env, но процесс не видит` — записан, но нужен рестарт).
 
 ## Настройки
 
@@ -277,10 +277,10 @@ hermes memohood status
 Юнит- и компонентные тесты (включая отдельные наборы на `gate`, `post_recall`, `graph_rerank` и сквозной конвейер v1.1) прогоняются так — из нейтрального каталога, не изнутри папки плагина:
 
 ```
-python -m pytest tests -q -m "not integration"
+python -m pytest tests -q
 ```
 
-На момент публикации: **180 passed** (2 интеграционных теста исключены флагом `-m "not integration"` — они требуют живых API-ключей).
+На момент публикации: **247 passed, 1 skipped** (2 live-теста сами пропускаются без ключей в `~/.hermes/.env`, а не падают; для полностью офлайн-прогона добавьте `-m "not integration"`).
 
 ## Документация
 

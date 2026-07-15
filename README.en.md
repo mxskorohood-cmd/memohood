@@ -5,7 +5,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
   <a href="#quickstart"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
   <a href="#quickstart"><img alt="hermes-agent >=0.18" src="https://img.shields.io/badge/hermes--agent-%3E%3D0.18-blueviolet"></a>
-  <a href="tests/"><img alt="Tests: 181 passed" src="https://img.shields.io/badge/tests-181%20passed-brightgreen"></a>
+  <a href="tests/"><img alt="Tests: 247 passed, 1 skipped" src="https://img.shields.io/badge/tests-247%20passed-brightgreen"></a>
   <a href="README.md"><img alt="Docs: RU | EN" src="https://img.shields.io/badge/docs-RU%20%7C%20EN-informational"></a>
 </p>
 
@@ -145,7 +145,7 @@ Cloudflare powers vector search (embeddings, on the free tier), Gemini handles b
 hermes memohood status
 ```
 
-If the plugin loaded correctly, you'll see memory stats (empty for now) and the 30-day spend against the configured ceiling for each provider, at 0.
+If the plugin loaded correctly, you'll see memory stats (empty for now) and the 30-day spend against the configured ceiling for each provider, at 0 — and, at the end, a "Keys" block: the full `.env` path and each key's status (`✓ configured` with a mask / `✗ not set` / `⚠ in .env but the process can't see it yet` — saved, needs a restart).
 
 ## Settings
 
@@ -277,10 +277,10 @@ Recall (prefetch) happens before the reply and adds search time; fact capture (`
 Unit and component tests (including dedicated suites for `gate`, `post_recall`, `graph_rerank`, and the end-to-end v1.1 pipeline) run like this — from a neutral directory, not inside the plugin folder:
 
 ```
-python -m pytest tests -q -m "not integration"
+python -m pytest tests -q
 ```
 
-At publication time: **180 passed** (2 integration tests excluded by `-m "not integration"` — they require live API keys).
+At publication time: **247 passed, 1 skipped** (2 live tests self-skip without keys in `~/.hermes/.env` rather than failing; for a fully offline run add `-m "not integration"`).
 
 ## Documentation
 
