@@ -6,21 +6,55 @@
   <a href="#быстрый-старт"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
   <a href="#быстрый-старт"><img alt="hermes-agent >=0.18" src="https://img.shields.io/badge/hermes--agent-%3E%3D0.18-blueviolet"></a>
   <a href="tests/"><img alt="Tests: 247 passed, 1 skipped" src="https://img.shields.io/badge/tests-247%20passed-brightgreen"></a>
-  <a href="README.en.md"><img alt="Docs: RU | EN" src="https://img.shields.io/badge/docs-RU%20%7C%20EN-informational"></a>
+</p>
+
+<h3 align="center">🌐 Русский · <a href="README.en.md">English</a></h3>
+
+<p align="center">
+  <a href="https://www.youtube.com/@MaximSkorohood"><img alt="YouTube: @MaximSkorohood" src="https://img.shields.io/badge/YouTube-%40MaximSkorohood-FF0000?logo=youtube&logoColor=white"></a>
+  <a href="https://t.me/+XrhmiKgCQdY5MjFi"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-community-26A5E4?logo=telegram&logoColor=white"></a>
+  <a href="https://skorehood.com"><img alt="skorehood.com" src="https://img.shields.io/badge/skorehood.com-0A0A0A?logo=googlechrome&logoColor=white"></a>
 </p>
 
 <p align="center">
   <a href="#быстрый-старт">Быстрый старт</a> ·
   <a href="#инструменты-и-команды">Инструменты и команды</a> ·
   <a href="#настройки">Настройки</a> ·
-  <a href="#частые-вопросы">FAQ</a> ·
-  <a href="README.en.md">English</a> ·
-  <a href="https://skorehood.com">skorehood.com</a> ·
-  <a href="https://www.youtube.com/@MaximSkorohood">YouTube</a> ·
-  <a href="https://t.me/+XrhmiKgCQdY5MjFi">Telegram</a>
+  <a href="#частые-вопросы">FAQ</a>
 </p>
 
 ---
+
+```mermaid
+flowchart TD
+    subgraph TURN["Каждый ход диалога"]
+        MSG["Сообщение пользователя"]
+        GATE{"gate — вспоминать?<br/>v1.1, по умолч. pass"}
+        PRE["гибридный поиск<br/>FTS5(RU-стемминг) + вектор BGE-M3 + RRF + Cohere rerank"]
+        GR["graph_rerank<br/>связи сессий, v1.1"]
+        POST["post_recall<br/>MMR + схлопывание дублей, v1.1"]
+        CTX["&lt;memory-context&gt; в промпте"]
+        ANS["Ответ модели"]
+        MSG --> GATE -->|"recall"| PRE --> GR --> POST --> CTX --> ANS
+        GATE -.->|"skip"| ANS
+    end
+
+    ANS --> SYNC["sync_turn<br/>фоновый поток, ответ не ждёт"]
+
+    subgraph CAPTURE["capture.py — двухступенчатая экстракция"]
+        SIG{"Бесплатные сигналы-ключевики"}
+        GEM["Gemini flash-lite<br/>только спорные случаи"]
+        SUP{"supersede-классификатор<br/>cosine + LLM-judge"}
+        SIG -->|"явный сигнал"| SUP
+        SIG -->|"спорно"| GEM --> SUP
+    end
+
+    SYNC --> SIG
+    SUP -->|"ADD / SUPERSEDE / NOOP"| DB[("memory.db<br/>captures + история замещений")]
+
+    DB -.->|"ночью, hermes cron"| NIGHT["Консолидация:<br/>decay Эббингауза (кроме pinned) →<br/>dedup → rollup день→неделя→месяц → FTS-rebuild"]
+    NIGHT -.-> DB
+```
 
 ## Что делает MemoHood?
 
@@ -57,37 +91,6 @@ MemoHood — это плагин памяти диалогов для [hermes-ag
 ## Как это работает?
 
 Каждый ход диалога проходит через prefetch, и это целый конвейер: `gate` решает, стоит ли вообще вспоминать → гибридный поиск (FTS5 + вектор + RRF + опц. Cohere) достаёт кандидатов → `graph_rerank` поднимает контекстно-связанное по графу сессий → `post_recall` убирает дубли и добавляет разнообразия. Итог MemoHood подмешивает в промпт отдельным блоком `<memory-context>`. После того как модель ответила, в фоновом потоке (не блокируя ответ) запускается `sync_turn`: он разбирает реплику на сигналы, при необходимости зовёт Gemini на спорные случаи и решает — добавить новую запись, заменить старую (supersede) или ничего не делать (дубль). Ночью, по расписанию `hermes cron`, отдельно запускается консолидация: угасание confidence, дедуп, свёртка старых записей и перестройка индекса.
-
-```mermaid
-flowchart LR
-    subgraph TURN["Каждый ход диалога"]
-        MSG["Сообщение пользователя"]
-        GATE{"gate — вспоминать?<br/>v1.1, по умолч. pass"}
-        PRE["гибридный поиск<br/>FTS5(RU-стемминг) + вектор BGE-M3 + RRF + Cohere rerank"]
-        GR["graph_rerank<br/>связи сессий, v1.1"]
-        POST["post_recall<br/>MMR + схлопывание дублей, v1.1"]
-        CTX["&lt;memory-context&gt; в промпте"]
-        ANS["Ответ модели"]
-        MSG --> GATE -->|"recall"| PRE --> GR --> POST --> CTX --> ANS
-        GATE -.->|"skip"| ANS
-    end
-
-    ANS --> SYNC["sync_turn<br/>фоновый поток, ответ не ждёт"]
-
-    subgraph CAPTURE["capture.py — двухступенчатая экстракция"]
-        SIG{"Бесплатные сигналы-ключевики"}
-        GEM["Gemini flash-lite<br/>только спорные случаи"]
-        SUP{"supersede-классификатор<br/>cosine + LLM-judge"}
-        SIG -->|"явный сигнал"| SUP
-        SIG -->|"спорно"| GEM --> SUP
-    end
-
-    SYNC --> SIG
-    SUP -->|"ADD / SUPERSEDE / NOOP"| DB[("memory.db<br/>captures + история замещений")]
-
-    DB -.->|"ночью, hermes cron"| NIGHT["Консолидация:<br/>decay Эббингауза (кроме pinned) →<br/>dedup → rollup день→неделя→месяц → FTS-rebuild"]
-    NIGHT -.-> DB
-```
 
 ## MemoHood vs альтернативы
 

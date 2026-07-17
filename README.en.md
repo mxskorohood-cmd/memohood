@@ -6,21 +6,55 @@
   <a href="#quickstart"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
   <a href="#quickstart"><img alt="hermes-agent >=0.18" src="https://img.shields.io/badge/hermes--agent-%3E%3D0.18-blueviolet"></a>
   <a href="tests/"><img alt="Tests: 247 passed, 1 skipped" src="https://img.shields.io/badge/tests-247%20passed-brightgreen"></a>
-  <a href="README.md"><img alt="Docs: RU | EN" src="https://img.shields.io/badge/docs-RU%20%7C%20EN-informational"></a>
+</p>
+
+<h3 align="center">🌐 <a href="README.md">Русский</a> · English</h3>
+
+<p align="center">
+  <a href="https://www.youtube.com/@MaximSkorohood"><img alt="YouTube: @MaximSkorohood" src="https://img.shields.io/badge/YouTube-%40MaximSkorohood-FF0000?logo=youtube&logoColor=white"></a>
+  <a href="https://t.me/+XrhmiKgCQdY5MjFi"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-community-26A5E4?logo=telegram&logoColor=white"></a>
+  <a href="https://skorehood.com"><img alt="skorehood.com" src="https://img.shields.io/badge/skorehood.com-0A0A0A?logo=googlechrome&logoColor=white"></a>
 </p>
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#tools-and-commands">Tools & commands</a> ·
   <a href="#settings">Settings</a> ·
-  <a href="#faq">FAQ</a> ·
-  <a href="README.md">Русский</a> ·
-  <a href="https://skorehood.com">skorehood.com</a> ·
-  <a href="https://www.youtube.com/@MaximSkorohood">YouTube</a> ·
-  <a href="https://t.me/+XrhmiKgCQdY5MjFi">Telegram</a>
+  <a href="#faq">FAQ</a>
 </p>
 
 ---
+
+```mermaid
+flowchart TD
+    subgraph TURN["Every conversation turn"]
+        MSG["User message"]
+        GATE{"gate — recall?<br/>v1.1, default pass"}
+        PRE["hybrid search<br/>FTS5 (RU stemming) + BGE-M3 vector + RRF + Cohere rerank"]
+        GR["graph_rerank<br/>session links, v1.1"]
+        POST["post_recall<br/>MMR + duplicate collapsing, v1.1"]
+        CTX["&lt;memory-context&gt; in the prompt"]
+        ANS["Model's reply"]
+        MSG --> GATE -->|"recall"| PRE --> GR --> POST --> CTX --> ANS
+        GATE -.->|"skip"| ANS
+    end
+
+    ANS --> SYNC["sync_turn<br/>background thread, reply doesn't wait"]
+
+    subgraph CAPTURE["capture.py — two-stage extraction"]
+        SIG{"Free keyword signals"}
+        GEM["Gemini flash-lite<br/>borderline cases only"]
+        SUP{"supersede classifier<br/>cosine + LLM judge"}
+        SIG -->|"clear signal"| SUP
+        SIG -->|"borderline"| GEM --> SUP
+    end
+
+    SYNC --> SIG
+    SUP -->|"ADD / SUPERSEDE / NOOP"| DB[("memory.db<br/>captures + supersede history")]
+
+    DB -.->|"nightly, via hermes cron"| NIGHT["Consolidation:<br/>Ebbinghaus decay (pinned exempt) →<br/>dedup → day→week→month rollup → FTS rebuild"]
+    NIGHT -.-> DB
+```
 
 ## What is MemoHood?
 
@@ -57,37 +91,6 @@ Three stages make recall sharper and more varied. Two are on by default, the thi
 ## How does it work?
 
 Every conversation turn goes through a prefetch step — and it's a whole pipeline: `gate` decides whether to recall at all → hybrid search (FTS5 + vector + RRF + optional Cohere) pulls candidates → `graph_rerank` lifts context-linked records via the session graph → `post_recall` drops duplicates and adds variety. MemoHood blends the result into the prompt as a separate `<memory-context>` block. Once the model has replied, a background thread (never blocking the reply) runs `sync_turn`: it breaks the turn down into signals, calls Gemini on the borderline cases when needed, and decides whether to add a new record, replace an old one (supersede), or do nothing (duplicate). Overnight, on a `hermes cron` schedule, a separate consolidation pass runs: confidence decay, dedup, rolling up old records, and rebuilding the index.
-
-```mermaid
-flowchart LR
-    subgraph TURN["Every conversation turn"]
-        MSG["User message"]
-        GATE{"gate — recall?<br/>v1.1, default pass"}
-        PRE["hybrid search<br/>FTS5 (RU stemming) + BGE-M3 vector + RRF + Cohere rerank"]
-        GR["graph_rerank<br/>session links, v1.1"]
-        POST["post_recall<br/>MMR + duplicate collapsing, v1.1"]
-        CTX["&lt;memory-context&gt; in the prompt"]
-        ANS["Model's reply"]
-        MSG --> GATE -->|"recall"| PRE --> GR --> POST --> CTX --> ANS
-        GATE -.->|"skip"| ANS
-    end
-
-    ANS --> SYNC["sync_turn<br/>background thread, reply doesn't wait"]
-
-    subgraph CAPTURE["capture.py — two-stage extraction"]
-        SIG{"Free keyword signals"}
-        GEM["Gemini flash-lite<br/>borderline cases only"]
-        SUP{"supersede classifier<br/>cosine + LLM judge"}
-        SIG -->|"clear signal"| SUP
-        SIG -->|"borderline"| GEM --> SUP
-    end
-
-    SYNC --> SIG
-    SUP -->|"ADD / SUPERSEDE / NOOP"| DB[("memory.db<br/>captures + supersede history")]
-
-    DB -.->|"nightly, via hermes cron"| NIGHT["Consolidation:<br/>Ebbinghaus decay (pinned exempt) →<br/>dedup → day→week→month rollup → FTS rebuild"]
-    NIGHT -.-> DB
-```
 
 ## MemoHood vs the alternatives
 
